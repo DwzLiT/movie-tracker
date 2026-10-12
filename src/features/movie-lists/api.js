@@ -1,86 +1,120 @@
-const LISTS_URL = import.meta.env.VITE_TESTAPI_LISTS_URL
-const SAVED_MOVIES_URL = import.meta.env.VITE_TESTAPI_SAVED_MOVIES_URL
+// src/features/movie-lists/api.js  (Supabase version)
+// Same exported functions as the testapi.io version, and the same camelCase
+// shapes ({ userId, listId, tmdbId }) so MovieLists.jsx should not need changes.
+import { supabase } from '../../lib/supabase'
 
-function collectionUrl(url, id) {
-  if (!url) {
-    throw new Error('Configure the testapi.io collection URL in .env.local first.')
+// ---------- helpers ----------
+
+// Turn a Supabase error into a readable message.
+// `overrides` lets each function give its own wording for a specific error code.
+function errorMessage(error, overrides = {}) {
+  if (overrides[error.code]) return overrides[error.code]
+  switch (error.code) {
+    case '22P02': return 'An ID has the wrong format. Supabase IDs are uuids, not the old testapi.io IDs.'
+    case '23502': return 'A required field is missing.'
+    case '23503': return 'That item is missing, or other items still depend on it.'
+    case '23505': return 'That item already exists.'
+    case '23514': return 'A value is not allowed (check name, email, status, or rating 1-10).'
+    case '42501': return 'Supabase blocked this (row level security). Check your policies.'
+    case '42P01': return 'A Supabase table is missing. Run the SQL setup first.'
+    case '42703': return 'A column name is wrong (use snake_case like user_id).'
+    default: return error.message || 'Supabase request failed.'
   }
-
-  return id ? `${url.replace(/\/$/, '')}/${encodeURIComponent(id)}` : url
 }
 
-async function request(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  })
-
-  if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `Request failed (${response.status}).`)
+function unwrap({ data, error }, overrides) {
+  if (error) {
+    console.error('Supabase error:', error.code, error.message)
+    throw new Error(errorMessage(error, overrides))
   }
-
-  if (response.status === 204) return null
-  return response.json()
+  return data
 }
 
-function records(data) {
-  if (Array.isArray(data)) return data
-  if (Array.isArray(data?.data)) return data.data
-  if (Array.isArray(data?.records)) return data.records
-  return data ? [data] : []
+// database row (snake_case) -> app shape (camelCase)
+function toList(row) {
+  return { id: row.id, userId: row.user_id, name: row.name }
 }
 
-async function getRecord(url, id) {
-  const data = await request(collectionUrl(url, id))
-  const record = records(data)[0]
-  if (!record) throw new Error('The selected item no longer exists.')
-  return record
+function toSavedMovie(row) {
+  return {
+    id: row.id,
+    listId: row.list_id,
+    tmdbId: String(row.tmdb_id), // the app used strings before
+    status: row.status,
+    // keep the old behaviour: no rating key when there is no rating
+    ...(row.rating == null ? {} : { rating: row.rating }),
+  }
 }
 
-function withoutId(record) {
-  const fields = { ...record }
-  delete fields.id
-  return fields
+// '' means "no rating" -> null. Anything else must be 1-10.
+function parseRating(value) {
+  if (value === '' || value === null || value === undefined) return null
+  const rating = Number(value)
+  if (!Number.isFinite(rating) || rating < 1 || rating > 10) {
+    throw new Error('Rating must be a number from 1 to 10.')
+  }
+  return rating
 }
+
+// ---------- movie lists ----------
 
 export async function getMovieLists(userId) {
-  const data = await request(collectionUrl(LISTS_URL))
-  return records(data).filter((list) => String(list.userId) === String(userId))
+  const data = unwrap(
+    await supabase.from('movie_lists').select('*').eq('user_id', userId).order('created_at'),
+  )
+  return data.map(toList)
 }
 
 export async function createMovieList({ userId, name }) {
   const cleanName = name.trim()
   if (!userId) throw new Error('Enter a user ID before creating a list.')
   if (!cleanName) throw new Error('List name cannot be empty.')
-  return request(collectionUrl(LISTS_URL), {
-    method: 'POST',
-    body: JSON.stringify({ userId: String(userId), name: cleanName }),
-  })
+
+  const data = unwrap(
+    await supabase.from('movie_lists').insert({ user_id: userId, name: cleanName }).select().single(),
+    { 23503: 'That user does not exist.' },
+  )
+  return toList(data)
 }
 
 export async function updateMovieList(id, changes) {
-  const name = changes.name?.trim()
-  if (changes.name !== undefined && !name) throw new Error('List name cannot be empty.')
-  const current = await getRecord(LISTS_URL, id)
-  return request(collectionUrl(LISTS_URL, id), {
-    method: 'PUT',
-    body: JSON.stringify({ ...withoutId(current), ...changes, ...(name ? { name } : {}), userId: String(current.userId) }),
-  })
+  const patch = {}
+  if (changes.name !== undefined) {
+    const name = changes.name.trim()
+    if (!name) throw new Error('List name cannot be empty.')
+    patch.name = name
+  }
+
+  const data = unwrap(await supabase.from('movie_lists').update(patch).eq('id', id).select())
+  // 0 rows = it doesn't exist (or RLS hid it)
+  if (!data.length) throw new Error('The selected item no longer exists.')
+  return toList(data[0])
 }
 
 export async function deleteMovieList(id) {
-  const movies = await getSavedMovies(id)
-  if (movies.length) throw new Error('This list still has saved movies. Remove them before deleting the list.')
-  return request(collectionUrl(LISTS_URL, id), { method: 'DELETE' })
+  // Friendly pre-check (the database also enforces this with ON DELETE RESTRICT)
+  const { count, error } = await supabase
+    .from('saved_movies')
+    .select('id', { count: 'exact', head: true })
+    .eq('list_id', id)
+  if (error) throw new Error(errorMessage(error))
+  if (count > 0) throw new Error('This list still has saved movies. Remove them before deleting the list.')
+
+  const data = unwrap(
+    await supabase.from('movie_lists').delete().eq('id', id).select('id'),
+    { 23503: 'This list still has saved movies. Remove them before deleting the list.' },
+  )
+  if (!data.length) throw new Error('The selected item no longer exists.')
+  return null
 }
 
+// ---------- saved movies ----------
+
 export async function getSavedMovies(listId) {
-  const data = await request(collectionUrl(SAVED_MOVIES_URL))
-  return records(data).filter((movie) => String(movie.listId) === String(listId))
+  const data = unwrap(
+    await supabase.from('saved_movies').select('*').eq('list_id', listId).order('created_at'),
+  )
+  return data.map(toSavedMovie)
 }
 
 export async function createSavedMovie({ listId, tmdbId, status = 'Want to Watch', rating = '' }) {
@@ -88,48 +122,30 @@ export async function createSavedMovie({ listId, tmdbId, status = 'Want to Watch
   const cleanTmdbId = String(tmdbId).trim()
   if (!/^\d+$/.test(cleanTmdbId)) throw new Error('Enter a valid numeric TMDB ID.')
 
-  const [lists, movies] = await Promise.all([
-    request(collectionUrl(LISTS_URL)).then(records),
-    getSavedMovies(listId),
-  ])
-  if (!lists.some((list) => String(list.id) === String(listId))) {
-    throw new Error('The selected movie list no longer exists.')
-  }
-  if (movies.some((movie) => String(movie.tmdbId) === cleanTmdbId)) {
-    throw new Error('That movie is already saved in this list.')
-  }
+  const row = { list_id: listId, tmdb_id: Number(cleanTmdbId), status }
+  const cleanRating = parseRating(rating)
+  if (cleanRating !== null) row.rating = cleanRating
 
-  return request(collectionUrl(SAVED_MOVIES_URL), {
-    method: 'POST',
-    body: JSON.stringify({
-      listId: String(listId),
-      tmdbId: cleanTmdbId,
-      status,
-      ...(rating === '' ? {} : { rating: Number(rating) }),
-    }),
+  // No need to pre-fetch: the database enforces the foreign key and UNIQUE (list_id, tmdb_id)
+  const data = unwrap(await supabase.from('saved_movies').insert(row).select().single(), {
+    23505: 'That movie is already saved in this list.',
+    23503: 'The selected movie list no longer exists.',
   })
+  return toSavedMovie(data)
 }
 
 export async function updateSavedMovie(id, changes) {
-  const next = { ...changes }
-  if (next.rating === '') {
-    delete next.rating
-  } else if (next.rating !== undefined) {
-    const rating = Number(next.rating)
-    if (!Number.isFinite(rating) || rating < 1 || rating > 10) {
-      throw new Error('Rating must be a number from 1 to 10.')
-    }
-    next.rating = rating
-  }
-  const current = await getRecord(SAVED_MOVIES_URL, id)
-  const currentFields = withoutId(current)
-  delete currentFields.notes
-  return request(collectionUrl(SAVED_MOVIES_URL, id), {
-    method: 'PUT',
-    body: JSON.stringify({ ...currentFields, ...next, listId: String(current.listId), tmdbId: String(current.tmdbId) }),
-  })
+  const patch = {}
+  if (changes.status !== undefined) patch.status = changes.status
+  // '' clears the rating (null); undefined leaves it unchanged
+  if (changes.rating !== undefined) patch.rating = parseRating(changes.rating)
+
+  const data = unwrap(await supabase.from('saved_movies').update(patch).eq('id', id).select())
+  if (!data.length) throw new Error('The selected item no longer exists.')
+  return toSavedMovie(data[0])
 }
 
 export async function deleteSavedMovie(id) {
-  return request(collectionUrl(SAVED_MOVIES_URL, id), { method: 'DELETE' })
+  unwrap(await supabase.from('saved_movies').delete().eq('id', id))
+  return null
 }
